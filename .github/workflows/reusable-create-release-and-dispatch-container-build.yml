@@ -1,0 +1,117 @@
+name: Reusable Create Release and Dispatch Container Build
+
+on:
+  workflow_call:
+    inputs:
+      release_branch:
+        description: Branch expected for merged release PRs.
+        required: false
+        type: string
+        default: main
+      bump_type:
+        description: Optional manual override (major, minor, micro).
+        required: false
+        type: string
+      source_branch:
+        description: Optional manual override for target commitish branch.
+        required: false
+        type: string
+      tag_prefix:
+        description: Prefix for semantic version tags.
+        required: false
+        type: string
+        default: v
+      dispatch_build_workflow:
+        description: Dispatch the downstream container build workflow after release creation.
+        required: false
+        type: boolean
+        default: true
+      build_workflow_file:
+        description: Workflow file name to dispatch for container build (in consumer repository).
+        required: false
+        type: string
+        default: push-to-container-registry.yml
+      build_workflow_input_name:
+        description: Optional input name expected by the downstream build workflow for release tag.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      release_api_token:
+        description: Optional token for GitHub API operations.
+        required: false
+    outputs:
+      next_tag:
+        description: Next semantic version tag created by this workflow.
+        value: ${{ jobs.create_semantic_version_release.outputs.next_tag }}
+      release_url:
+        description: URL of the created (or existing) GitHub release.
+        value: ${{ jobs.create_semantic_version_release.outputs.release_url }}
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-and-dispatch-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  create_semantic_version_release:
+    name: Create Semantic Version Release
+    uses: ./.github/workflows/reusable-create-semantic-version-release.yml
+    with:
+      release_branch: ${{ inputs.release_branch }}
+      bump_type: ${{ inputs.bump_type }}
+      source_branch: ${{ inputs.source_branch }}
+      tag_prefix: ${{ inputs.tag_prefix }}
+    secrets:
+      release_api_token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN }}
+
+  dispatch_container_build_from_semantic_tag:
+    name: Dispatch Container Build from Semantic Tag
+    runs-on: ubuntu-latest
+    needs:
+      - create_semantic_version_release
+    if: ${{ inputs.dispatch_build_workflow && needs.create_semantic_version_release.outputs.next_tag != '' }}
+    steps:
+      - name: Dispatch tag-based build workflow
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.create_semantic_version_release.outputs.next_tag }}
+          BUILD_WORKFLOW_FILE: ${{ inputs.build_workflow_file }}
+          BUILD_WORKFLOW_INPUT_NAME: ${{ inputs.build_workflow_input_name }}
+        with:
+          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          script: |
+            const releaseTag = String(process.env.RELEASE_TAG || "").trim();
+            const buildWorkflowFile = String(process.env.BUILD_WORKFLOW_FILE || "").trim();
+            const buildWorkflowInputName = String(process.env.BUILD_WORKFLOW_INPUT_NAME || "").trim();
+
+            if (!releaseTag) {
+              core.setFailed("Missing release tag output from semantic release workflow.");
+              return;
+            }
+            if (!buildWorkflowFile) {
+              core.setFailed("build_workflow_file input is required.");
+              return;
+            }
+            const dispatchParams = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: buildWorkflowFile,
+              ref: releaseTag
+            };
+
+            if (buildWorkflowInputName) {
+              dispatchParams.inputs = { [buildWorkflowInputName]: releaseTag };
+            }
+
+            await github.rest.actions.createWorkflowDispatch(dispatchParams);
+
+            if (buildWorkflowInputName) {
+              core.notice(`Dispatched '${buildWorkflowFile}' with ${buildWorkflowInputName}='${releaseTag}' on ref '${releaseTag}'.`);
+            } else {
+              core.notice(`Dispatched '${buildWorkflowFile}' on ref '${releaseTag}' without workflow inputs.`);
+            }

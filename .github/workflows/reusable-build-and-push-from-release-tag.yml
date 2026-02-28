@@ -1,0 +1,56 @@
+name: Reusable Build and Push from Release Tag
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Optional semantic tag override (for example v1.2.3). Defaults to github.ref_name.
+        required: false
+        type: string
+        default: ""
+      deployment_environment:
+        description: GitHub environment name (for example production).
+        required: false
+        type: string
+        default: production
+      additional_image_tags:
+        description: Optional comma or space separated list of extra Docker tags.
+        required: false
+        type: string
+        default: latest
+      image_name:
+        description: Optional image name override.
+        required: false
+        type: string
+    secrets:
+      artifactory_registry_repository:
+        description: Optional registry repository path (for example docker-local/my-team).
+        required: false
+      artifactory_registry_host:
+        description: Optional registry hostname when not using inherited uppercase secret names.
+        required: false
+      artifactory_username:
+        description: Optional Artifactory username when not using inherited uppercase secret names.
+        required: false
+      artifactory_token:
+        description: Optional Artifactory token when not using inherited uppercase secret names.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_push_container_image:
+    name: Build and Push Container Image
+    uses: ./.github/workflows/reusable-build-and-push-artifactory.yml
+    with:
+      deployment_environment: ${{ inputs.deployment_environment }}
+      checkout_ref: ${{ inputs.release_tag || github.ref_name }}
+      image_name: ${{ inputs.image_name }}
+      image_tag: ${{ inputs.release_tag || github.ref_name }}
+      additional_image_tags: ${{ inputs.additional_image_tags }}
+    secrets:
+      artifactory_registry_repository: ${{ secrets.artifactory_registry_repository }}
+      artifactory_registry_host: ${{ secrets.artifactory_registry_host }}
+      artifactory_username: ${{ secrets.artifactory_username }}
+      artifactory_token: ${{ secrets.artifactory_token }}

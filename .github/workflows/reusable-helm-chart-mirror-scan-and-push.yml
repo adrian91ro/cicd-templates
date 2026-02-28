@@ -1,0 +1,246 @@
+name: Reusable Helm Chart Mirror, Scan, and Push
+
+on:
+  workflow_call:
+    inputs:
+      helm_repo_name:
+        description: Helm repository name alias (for example bitnami).
+        required: true
+        type: string
+      helm_repo_url:
+        description: Helm repository URL (for example https://charts.bitnami.com/bitnami).
+        required: true
+        type: string
+      helm_chart_name:
+        description: Chart name in repository (for example nginx).
+        required: true
+        type: string
+      helm_chart_version:
+        description: Optional chart version constraint.
+        required: false
+        type: string
+      helm_set:
+        description: Optional comma-separated --set overrides passed to helm template.
+        required: false
+        type: string
+      helm_values_file:
+        description: Optional repository-relative values file path used for templating.
+        required: false
+        type: string
+      helm_values_yaml:
+        description: Optional inline YAML values content used for templating.
+        required: false
+        type: string
+      helm_release_name:
+        description: Helm release name used for template rendering.
+        required: false
+        type: string
+        default: ci-release
+      helm_namespace:
+        description: Namespace used for template rendering.
+        required: false
+        type: string
+        default: default
+      deployment_environment:
+        description: GitHub environment name (for example development or production).
+        required: false
+        type: string
+      registry_repository:
+        description: Optional registry repository path override (for example docker-local/my-team).
+        required: false
+        type: string
+      mirror_path_prefix:
+        description: Path prefix under repository where chart images are mirrored.
+        required: false
+        type: string
+        default: helm-chart-images
+    secrets:
+      artifactory_registry_repository:
+        description: Optional registry repository path when not using vars/uppercase secrets.
+        required: false
+      artifactory_registry_host:
+        description: Registry hostname, for example artifactory.example.com.
+        required: false
+      artifactory_helm_registry_host:
+        description: Helm repository hostname, for example artifactory.example.com.
+        required: false
+      artifactory_username:
+        description: Artifactory username with push permission.
+        required: false
+      artifactory_token:
+        description: Artifactory access token or password.
+        required: false
+    outputs:
+      source_image_refs:
+        description: Source image references discovered from Helm chart templates.
+        value: ${{ jobs.helm_chart_mirror_scan_and_push.outputs.source_image_refs }}
+      mirrored_image_refs:
+        description: Mirrored image references pushed to Artifactory.
+        value: ${{ jobs.helm_chart_mirror_scan_and_push.outputs.mirrored_image_refs }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helm_chart_mirror_scan_and_push:
+    name: Helm Chart Mirror, Scan, and Push
+    runs-on: self-hosted
+    timeout-minutes: 120
+    environment: ${{ inputs.deployment_environment || (github.ref_name == 'main' && 'production' || 'development') }}
+    outputs:
+      source_image_refs: ${{ steps.mirror_refs.outputs.source_image_refs }}
+      mirrored_image_refs: ${{ steps.tag_mirror_images.outputs.target_image_refs }}
+    env:
+      RAW_CI_REGISTRY_HOST: ${{ secrets.artifactory_registry_host || secrets.ARTIFACTORY_CONTAINER_REGISTRY_HOST || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
+      RAW_CI_REGISTRY_REPOSITORY: ${{ inputs.registry_repository || secrets.artifactory_registry_repository || secrets.ARTIFACTORY_CONTAINER_REPO || vars.ARTIFACTORY_CONTAINER_REPO || vars.CI_REGISTRY_REPOSITORY }}
+      RAW_HELM_REGISTRY_HOST: ${{ secrets.artifactory_helm_registry_host || secrets.ARTIFACTORY_HELM_REGISTRY_HOST || vars.ARTIFACTORY_HELM_REGISTRY_HOST || secrets.artifactory_registry_host || secrets.ARTIFACTORY_CONTAINER_REGISTRY_HOST || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
+      RAW_HELM_REPOSITORY: ${{ secrets.ARTIFACTORY_HELM_REPO || vars.ARTIFACTORY_HELM_REPO || secrets.artifactory_registry_repository || secrets.ARTIFACTORY_CONTAINER_REPO || vars.CI_HELM_REPOSITORY }}
+      CI_HELM_IMAGE: ${{ vars.CI_HELM_IMAGE || 'alpine/helm:3.17.1' }}
+      CI_CLAMAV_IMAGE: ${{ vars.CI_CLAMAV_IMAGE || 'clamav/clamav:stable' }}
+      CI_YARA_IMAGE: ${{ vars.CI_YARA_IMAGE || 'alpine:3.20' }}
+      CI_TRIVY_IMAGE: ${{ vars.CI_TRIVY_IMAGE || 'aquasec/trivy:0.57.1' }}
+      CI_TRIVY_SCANNERS: ${{ vars.CI_TRIVY_SCANNERS || 'vuln,secret,misconfig' }}
+      CI_TRIVY_PKG_TYPES: ${{ vars.CI_TRIVY_PKG_TYPES || 'os,library' }}
+      CI_TRIVY_SEVERITY: ${{ vars.CI_TRIVY_SEVERITY || 'CRITICAL,HIGH' }}
+      CI_TRIVY_IGNORE_STATUSES: ${{ vars.CI_TRIVY_IGNORE_STATUSES || 'fixed' }}
+      CI_TRIVY_WARM_DB: ${{ vars.CI_TRIVY_WARM_DB || 'true' }}
+      CI_CLAMAV_WARM_DB: ${{ vars.CI_CLAMAV_WARM_DB || 'true' }}
+      CI_HELM_PUSH_MODE: ${{ vars.CI_HELM_PUSH_MODE || 'auto' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Extract Helm chart and list container images
+        id: chart_images
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          HELM_REPO_NAME: ${{ inputs.helm_repo_name }}
+          HELM_REPO_URL: ${{ inputs.helm_repo_url }}
+          HELM_CHART_NAME: ${{ inputs.helm_chart_name }}
+          HELM_CHART_VERSION: ${{ inputs.helm_chart_version }}
+          HELM_SET: ${{ inputs.helm_set }}
+          HELM_VALUES_FILE: ${{ inputs.helm_values_file }}
+          HELM_VALUES_YAML: ${{ inputs.helm_values_yaml }}
+          HELM_RELEASE_NAME: ${{ inputs.helm_release_name }}
+          HELM_NAMESPACE: ${{ inputs.helm_namespace }}
+          HELM_IMAGE: ${{ env.CI_HELM_IMAGE }}
+        with:
+          script: resolve_helm_chart_images.sh
+
+      - name: Normalize registry host and repository
+        id: registry_target
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          REGISTRY_HOST: ${{ env.RAW_CI_REGISTRY_HOST }}
+          REGISTRY_REPOSITORY: ${{ env.RAW_CI_REGISTRY_REPOSITORY }}
+        with:
+          script: normalize_registry_target.sh
+
+      - name: Resolve mirror image references
+        id: mirror_refs
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          IMAGE_REFS: ${{ steps.chart_images.outputs.image_refs }}
+          REGISTRY_HOST: ${{ steps.registry_target.outputs.registry_host }}
+          REGISTRY_REPOSITORY: ${{ steps.registry_target.outputs.registry_repository }}
+          MIRROR_PATH_PREFIX: ${{ inputs.mirror_path_prefix }}
+        with:
+          script: resolve_mirror_image_refs.sh
+
+      - name: Pull source images
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          IMAGE_REFS: ${{ steps.mirror_refs.outputs.source_image_refs }}
+        with:
+          script: docker_pull_many.sh
+
+      - name: Scan source images (Trivy, ClamAV, YARA)
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          IMAGE_REFS: ${{ steps.mirror_refs.outputs.source_image_refs }}
+          CLAMAV_IMAGE: ${{ env.CI_CLAMAV_IMAGE }}
+          YARA_IMAGE: ${{ env.CI_YARA_IMAGE }}
+          TRIVY_IMAGE: ${{ env.CI_TRIVY_IMAGE }}
+          TRIVY_SCANNERS: ${{ env.CI_TRIVY_SCANNERS }}
+          TRIVY_PKG_TYPES: ${{ env.CI_TRIVY_PKG_TYPES }}
+          TRIVY_SEVERITY: ${{ env.CI_TRIVY_SEVERITY }}
+          TRIVY_IGNORE_STATUSES: ${{ env.CI_TRIVY_IGNORE_STATUSES }}
+          TRIVY_WARM_DB: ${{ env.CI_TRIVY_WARM_DB }}
+          CLAMAV_WARM_DB: ${{ env.CI_CLAMAV_WARM_DB }}
+        with:
+          script: scan_image_set.sh
+
+      - name: Tag mirrored images for Artifactory
+        id: tag_mirror_images
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          IMAGE_MAP: ${{ steps.mirror_refs.outputs.image_map }}
+        with:
+          script: docker_tag_image_map.sh
+
+      - name: Push mirrored images to Artifactory
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          REGISTRY_HOST: ${{ steps.registry_target.outputs.registry_host }}
+          IMAGE_REFS: ${{ steps.tag_mirror_images.outputs.target_image_refs }}
+          ARTIFACTORY_USERNAME: ${{ secrets.artifactory_username || secrets.ARTIFACTORY_USERNAME }}
+          ARTIFACTORY_TOKEN: ${{ secrets.artifactory_token || secrets.ARTIFACTORY_TOKEN }}
+        with:
+          script: docker_login_and_push_many.sh
+
+      - name: Push Helm chart package to Artifactory
+        id: push_helm_chart
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          HELM_REPO_NAME: ${{ inputs.helm_repo_name }}
+          HELM_REPO_URL: ${{ inputs.helm_repo_url }}
+          HELM_CHART_NAME: ${{ inputs.helm_chart_name }}
+          HELM_CHART_VERSION: ${{ inputs.helm_chart_version }}
+          HELM_IMAGE: ${{ env.CI_HELM_IMAGE }}
+          HELM_REGISTRY_HOST: ${{ env.RAW_HELM_REGISTRY_HOST }}
+          HELM_REPOSITORY: ${{ env.RAW_HELM_REPOSITORY }}
+          HELM_PUSH_MODE: ${{ env.CI_HELM_PUSH_MODE }}
+          ARTIFACTORY_USERNAME: ${{ secrets.artifactory_username || secrets.ARTIFACTORY_USERNAME }}
+          ARTIFACTORY_TOKEN: ${{ secrets.artifactory_token || secrets.ARTIFACTORY_TOKEN }}
+        with:
+          script: push_helm_chart_package.sh
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Helm Chart Mirror and Scan"
+            echo ""
+            echo "- Chart: \`${{ inputs.helm_repo_name }}/${{ inputs.helm_chart_name }}\`"
+            if [[ -n "${{ inputs.helm_chart_version }}" ]]; then
+              echo "- Chart version: \`${{ inputs.helm_chart_version }}\`"
+            else
+              echo "- Chart version: latest"
+            fi
+            echo "- Helm chart package: \`${{ steps.push_helm_chart.outputs.helm_chart_package }}\`"
+            echo "- Helm chart push mode: \`${{ steps.push_helm_chart.outputs.helm_chart_push_mode }}\`"
+            echo "- Helm chart push location: \`${{ steps.push_helm_chart.outputs.helm_chart_push_location }}\`"
+            echo "- Source image references:"
+            while IFS= read -r source_ref; do
+              if [[ -z "${source_ref}" ]]; then
+                continue
+              fi
+              echo "  - \`${source_ref}\`"
+            done <<< "${{ steps.mirror_refs.outputs.source_image_refs }}"
+            echo ""
+            echo "- Mirrored image references:"
+            while IFS= read -r mirrored_ref; do
+              if [[ -z "${mirrored_ref}" ]]; then
+                continue
+              fi
+              echo "  - \`${mirrored_ref}\`"
+            done <<< "${{ steps.tag_mirror_images.outputs.target_image_refs }}"
+          } >> "${GITHUB_STEP_SUMMARY}"

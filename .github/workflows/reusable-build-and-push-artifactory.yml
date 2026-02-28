@@ -1,0 +1,157 @@
+name: Reusable Build and Push to Artifactory
+
+on:
+  workflow_call:
+    inputs:
+      deployment_environment:
+        description: GitHub environment name (for example development or production).
+        required: false
+        type: string
+      checkout_ref:
+        description: Optional git ref to checkout before build (for example a release tag).
+        required: false
+        type: string
+      registry_repository:
+        description: Registry path prefix, for example docker-local or docker-local/my-team.
+        required: false
+        type: string
+      image_name:
+        description: Image name (without tag), for example my-service.
+        required: false
+        type: string
+      image_tag:
+        description: Optional image tag. Defaults to commit SHA when unset.
+        required: false
+        type: string
+      additional_image_tags:
+        description: Optional comma or space separated list of extra Docker tags (for example latest).
+        required: false
+        type: string
+    secrets:
+      artifactory_registry_repository:
+        description: Optional registry repository path (for example docker-local/my-team).
+        required: false
+      artifactory_registry_host:
+        description: Registry hostname, for example artifactory.example.com.
+        required: false
+      artifactory_username:
+        description: Artifactory username with push permission.
+        required: false
+      artifactory_token:
+        description: Artifactory access token or password.
+        required: false
+    outputs:
+      image_ref:
+        description: Fully qualified image reference that was pushed.
+        value: ${{ jobs.build_and_push.outputs.image_ref }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_push:
+    name: Build and Push Image
+    runs-on: self-hosted
+    timeout-minutes: 30
+    environment: ${{ inputs.deployment_environment || (github.ref_name == 'main' && 'production' || 'development') }}
+    outputs:
+      image_ref: ${{ steps.image_ref.outputs.image_ref }}
+    env:
+      RAW_CI_REGISTRY_HOST: ${{ secrets.artifactory_registry_host || secrets.ARTIFACTORY_CONTAINER_REGISTRY_HOST || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
+      RAW_CI_REGISTRY_REPOSITORY: ${{ inputs.registry_repository || secrets.artifactory_registry_repository || secrets.ARTIFACTORY_CONTAINER_REPO || vars.ARTIFACTORY_CONTAINER_REPO || vars.CI_REGISTRY_REPOSITORY }}
+      CI_IMAGE_NAME: ${{ inputs.image_name || vars.CI_CONTAINER_IMAGE_NAME }}
+      CI_IMAGE_TAG: ${{ inputs.image_tag || vars.CI_IMAGE_TAG || github.sha }}
+      CI_ADDITIONAL_IMAGE_TAGS: ${{ inputs.additional_image_tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve container build file
+        id: build_file
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: resolve_build_file.sh
+
+      - name: Normalize registry host and repository
+        id: registry_target
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          REGISTRY_HOST: ${{ env.RAW_CI_REGISTRY_HOST }}
+          REGISTRY_REPOSITORY: ${{ env.RAW_CI_REGISTRY_REPOSITORY }}
+        with:
+          script: normalize_registry_target.sh
+
+      - name: Resolve image reference for push
+        id: image_ref
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          REGISTRY_HOST: ${{ steps.registry_target.outputs.registry_host }}
+          REGISTRY_REPOSITORY: ${{ steps.registry_target.outputs.registry_repository }}
+          IMAGE_NAME: ${{ env.CI_IMAGE_NAME }}
+          IMAGE_TAG: ${{ env.CI_IMAGE_TAG }}
+          REQUIRE_REGISTRY_REPOSITORY: "true"
+        with:
+          script: resolve_push_image_ref.sh
+
+      - name: Resolve image references list
+        id: image_refs
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          PRIMARY_IMAGE_REF: ${{ steps.image_ref.outputs.image_ref }}
+          REGISTRY_HOST: ${{ steps.registry_target.outputs.registry_host }}
+          REGISTRY_REPOSITORY: ${{ steps.registry_target.outputs.registry_repository }}
+          IMAGE_NAME: ${{ env.CI_IMAGE_NAME }}
+          ADDITIONAL_IMAGE_TAGS: ${{ env.CI_ADDITIONAL_IMAGE_TAGS }}
+        with:
+          script: resolve_additional_push_image_refs.sh
+
+      - name: Build image
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          BUILD_FILE: ${{ steps.build_file.outputs.path }}
+          IMAGE_REF: ${{ steps.image_ref.outputs.image_ref }}
+        with:
+          script: docker_build_image.sh
+
+      - name: Tag additional local images
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          PRIMARY_IMAGE_REF: ${{ steps.image_ref.outputs.image_ref }}
+          IMAGE_REFS: ${{ steps.image_refs.outputs.image_refs }}
+        with:
+          script: docker_tag_local_images.sh
+
+      - name: Push image tags to Artifactory
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          REGISTRY_HOST: ${{ steps.registry_target.outputs.registry_host }}
+          IMAGE_REFS: ${{ steps.image_refs.outputs.image_refs }}
+          ARTIFACTORY_USERNAME: ${{ secrets.artifactory_username || secrets.ARTIFACTORY_USERNAME }}
+          ARTIFACTORY_TOKEN: ${{ secrets.artifactory_token || secrets.ARTIFACTORY_TOKEN }}
+        with:
+          script: docker_login_and_push_many.sh
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Artifactory Push"
+            echo ""
+            echo "- Primary image: \`${{ steps.image_ref.outputs.image_ref }}\`"
+            echo "- Pushed image refs:"
+            while IFS= read -r image_ref; do
+              if [[ -z "${image_ref}" ]]; then
+                continue
+              fi
+              echo "  - \`${image_ref}\`"
+            done <<< "${{ steps.image_refs.outputs.image_refs }}"
+          } >> "${GITHUB_STEP_SUMMARY}"

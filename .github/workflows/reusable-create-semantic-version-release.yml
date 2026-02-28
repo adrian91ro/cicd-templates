@@ -1,0 +1,353 @@
+name: Reusable Create Semantic Version Release
+
+on:
+  workflow_call:
+    inputs:
+      release_branch:
+        description: Branch expected for merged release PRs.
+        required: false
+        type: string
+        default: main
+      bump_type:
+        description: Optional manual override (major, minor, micro).
+        required: false
+        type: string
+      source_branch:
+        description: Optional manual override for target commitish branch.
+        required: false
+        type: string
+      tag_prefix:
+        description: Prefix for semantic version tags.
+        required: false
+        type: string
+        default: v
+    secrets:
+      release_api_token:
+        description: Optional token for GitHub API operations.
+        required: false
+    outputs:
+      next_tag:
+        description: Next semantic version tag created by this workflow.
+        value: ${{ jobs.create_semantic_version_release.outputs.next_tag }}
+      release_url:
+        description: URL of the created (or existing) GitHub release.
+        value: ${{ jobs.create_semantic_version_release.outputs.release_url }}
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: semantic-version-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  create_semantic_version_release:
+    name: Create Semantic Version Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      next_tag: ${{ steps.version.outputs.next_tag }}
+      release_url: ${{ steps.release.outputs.release_url }}
+    env:
+      RELEASE_BRANCH: ${{ inputs.release_branch || 'main' }}
+      INPUT_BUMP_TYPE: ${{ inputs.bump_type }}
+      INPUT_SOURCE_BRANCH: ${{ inputs.source_branch }}
+      TAG_PREFIX: ${{ inputs.tag_prefix || 'v' }}
+    steps:
+      - name: Resolve semantic release inputs
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          script: |
+            const releaseBranch = process.env.RELEASE_BRANCH;
+            const normalizeBump = (value) => {
+              const normalized = String(value || "").trim().toLowerCase();
+              if (normalized === "patch") {
+                return "micro";
+              }
+              return normalized;
+            };
+
+            let bumpType = normalizeBump(process.env.INPUT_BUMP_TYPE);
+            let sourceBranch = String(process.env.INPUT_SOURCE_BRANCH || "").trim();
+            let prNumber = "";
+
+            if (bumpType && !sourceBranch) {
+              sourceBranch = releaseBranch;
+              core.notice(`'source_branch' not provided with manual bump input. Defaulting to '${releaseBranch}'.`);
+            }
+
+            if (!bumpType) {
+              let mergedPr = null;
+
+              try {
+                const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: context.sha
+                });
+
+                mergedPr = associated.data.find((item) =>
+                  item.base?.ref === releaseBranch &&
+                  item.state === "closed" &&
+                  item.merged_at
+                ) || null;
+              } catch (error) {
+                core.notice(`PR association lookup failed for commit ${context.sha}: ${error.message}`);
+              }
+
+              if (!mergedPr) {
+                for (let page = 1; page <= 5; page += 1) {
+                  const closedPulls = await github.rest.pulls.list({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    state: "closed",
+                    base: releaseBranch,
+                    sort: "updated",
+                    direction: "desc",
+                    per_page: 100,
+                    page
+                  });
+
+                  mergedPr = closedPulls.data.find((item) =>
+                    item.merged_at &&
+                    item.merge_commit_sha === context.sha
+                  ) || null;
+
+                  if (mergedPr || closedPulls.data.length < 100) {
+                    break;
+                  }
+                }
+              }
+
+              if (!mergedPr) {
+                const commitMessages = [
+                  context.payload.head_commit?.message || "",
+                  ...((context.payload.commits || []).map((item) => item.message || ""))
+                ];
+
+                let candidatePrNumber = null;
+                for (const message of commitMessages) {
+                  const mergeMatch = message.match(/Merge pull request #(\d+)/i);
+                  const squashMatch = message.match(/\(#(\d+)\)/);
+                  const value = mergeMatch?.[1] || squashMatch?.[1];
+                  if (value) {
+                    candidatePrNumber = Number(value);
+                    break;
+                  }
+                }
+
+                if (candidatePrNumber) {
+                  const candidate = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: candidatePrNumber
+                  });
+
+                  if (
+                    candidate.data.base?.ref === releaseBranch &&
+                    candidate.data.state === "closed" &&
+                    candidate.data.merged_at
+                  ) {
+                    mergedPr = candidate.data;
+                  }
+                }
+              }
+
+              if (!mergedPr) {
+                core.setFailed(`No merged PR associated with commit ${context.sha} for base branch '${releaseBranch}'.`);
+                return;
+              }
+
+              prNumber = String(mergedPr.number);
+              const body = mergedPr.body || "";
+
+              const selected = ["major", "minor", "micro", "patch"].filter((name) => {
+                const re = new RegExp(`-\\s*\\[(x|X)\\]\\s*${name}\\b`, "i");
+                return re.test(body);
+              });
+
+              if (selected.length === 0) {
+                bumpType = "micro";
+                core.notice("No semantic version checkbox selected in PR body. Defaulting to 'micro'.");
+              } else if (selected.length > 1) {
+                core.setFailed("Select at most one checkbox in PR body: major, minor, or micro.");
+                return;
+              } else {
+                bumpType = normalizeBump(selected[0]);
+              }
+            }
+
+            if (!sourceBranch) {
+              sourceBranch = releaseBranch;
+              core.notice(`No explicit source branch provided. Defaulting to '${releaseBranch}'.`);
+            }
+
+            if (!["major", "minor", "micro"].includes(bumpType)) {
+              core.setFailed(`Invalid bump type '${bumpType}'. Use major, minor, or micro.`);
+              return;
+            }
+
+            if (!sourceBranch) {
+              core.setFailed("Source branch is empty.");
+              return;
+            }
+
+            core.setOutput("bump_type", bumpType);
+            core.setOutput("source_branch", sourceBranch);
+            core.setOutput("pr_number", prNumber);
+
+      - name: Calculate next semantic version
+        id: version
+        uses: actions/github-script@v7
+        env:
+          BUMP_TYPE: ${{ steps.resolve.outputs.bump_type }}
+          TAG_PREFIX: ${{ env.TAG_PREFIX }}
+        with:
+          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          script: |
+            const bumpType = process.env.BUMP_TYPE;
+            const tagPrefix = process.env.TAG_PREFIX;
+            const escapedPrefix = tagPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const semverRegex = new RegExp(`^${escapedPrefix}(\\d+)\\.(\\d+)\\.(\\d+)$`);
+
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            const parseTag = (tagName) => {
+              const match = semverRegex.exec(tagName);
+              if (!match) {
+                return null;
+              }
+              return {
+                major: Number(match[1]),
+                minor: Number(match[2]),
+                patch: Number(match[3])
+              };
+            };
+
+            const compare = (a, b) => {
+              if (a.major !== b.major) return a.major - b.major;
+              if (a.minor !== b.minor) return a.minor - b.minor;
+              return a.patch - b.patch;
+            };
+
+            const versions = tags.map((tag) => parseTag(tag.name)).filter(Boolean);
+            let current = { major: 0, minor: 0, patch: 0 };
+            if (versions.length > 0) {
+              current = versions.sort(compare).at(-1);
+            }
+
+            const next = { ...current };
+            if (bumpType === "major") {
+              next.major += 1;
+              next.minor = 0;
+              next.patch = 0;
+            } else if (bumpType === "minor") {
+              next.minor += 1;
+              next.patch = 0;
+            } else {
+              next.patch += 1;
+            }
+
+            const nextTag = `${tagPrefix}${next.major}.${next.minor}.${next.patch}`;
+            core.setOutput("next_tag", nextTag);
+
+      - name: Ensure source branch exists
+        uses: actions/github-script@v7
+        env:
+          SOURCE_BRANCH: ${{ steps.resolve.outputs.source_branch }}
+        with:
+          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          script: |
+            const sourceBranch = process.env.SOURCE_BRANCH;
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: sourceBranch
+              });
+            } catch (error) {
+              core.setFailed(`Source branch '${sourceBranch}' was not found in ${context.repo.owner}/${context.repo.repo}.`);
+            }
+
+      - name: Create semantic version release
+        id: release
+        uses: actions/github-script@v7
+        env:
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+          SOURCE_BRANCH: ${{ steps.resolve.outputs.source_branch }}
+          BUMP_TYPE: ${{ steps.resolve.outputs.bump_type }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+        with:
+          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          script: |
+            const nextTag = process.env.NEXT_TAG;
+            const sourceBranch = process.env.SOURCE_BRANCH;
+            const bumpType = process.env.BUMP_TYPE;
+            const prNumber = process.env.PR_NUMBER;
+
+            try {
+              const existing = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: nextTag
+              });
+
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.data.id,
+                make_latest: "true"
+              });
+
+              core.setOutput("release_url", existing.data.html_url);
+              core.notice(`Release already exists for ${nextTag} and is marked as latest: ${existing.data.html_url}`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            const bodyLines = [
+              "Automated semantic version release.",
+              `- Bump type: ${bumpType}`,
+              `- Source branch: ${sourceBranch}`
+            ];
+
+            if (prNumber) {
+              bodyLines.push(`- Trigger PR: #${prNumber}`);
+            }
+
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: nextTag,
+              target_commitish: sourceBranch,
+              name: nextTag,
+              body: bodyLines.join("\n"),
+              generate_release_notes: true,
+              draft: false,
+              prerelease: false,
+              make_latest: "true"
+            });
+
+            core.setOutput("release_url", release.data.html_url);
+
+      - name: Publish semantic release summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Semantic Version Release"
+            echo ""
+            echo "- Tag: \`${{ steps.version.outputs.next_tag }}\`"
+            echo "- Source branch: \`${{ steps.resolve.outputs.source_branch }}\`"
+            echo "- URL: ${{ steps.release.outputs.release_url }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
