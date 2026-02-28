@@ -1,0 +1,49 @@
+name: Template Quality Gate
+run-name: Template Quality Gate (${{ github.ref_name }})
+
+on:
+  push:
+    branches:
+      - templates
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint_and_validate:
+    name: Lint and Validate Templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate workflow syntax (actionlint)
+        run: docker run --rm -v "${PWD}:/repo" -w /repo rhysd/actionlint:latest
+
+      - name: Validate bash syntax (bash -n)
+        run: |
+          set -euo pipefail
+          for script in .github/actions/*.sh; do
+            bash -n "${script}"
+          done
+
+      - name: Validate bash best practices (shellcheck)
+        run: docker run --rm -v "${PWD}:/mnt" koalaman/shellcheck:stable .github/actions/*.sh
+
+      - name: Validate YARA rule syntax
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}/.security/yara:/rules:ro" alpine:3.20 sh -lc '
+            set -eu
+            apk add --no-cache yara >/dev/null
+            yara -w /rules/basic-malware.yar /etc/hosts >/dev/null
+            yara -w /rules/webshell-and-cryptominer.yar /etc/hosts >/dev/null
+          '

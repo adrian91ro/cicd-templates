@@ -1,0 +1,93 @@
+name: Run Local CI Script
+description: Execute a repository script from .github/actions.
+
+inputs:
+  script:
+    description: Relative path to a bash script in the repository.
+    required: true
+
+outputs:
+  mode:
+    description: Optional script output key `mode`.
+    value: ${{ steps.exec.outputs.mode }}
+  image_ref:
+    description: Optional script output key `image_ref`.
+    value: ${{ steps.exec.outputs.image_ref }}
+  image_refs:
+    description: Optional script output key `image_refs`.
+    value: ${{ steps.exec.outputs.image_refs }}
+  source_image_refs:
+    description: Optional script output key `source_image_refs`.
+    value: ${{ steps.exec.outputs.source_image_refs }}
+  target_image_refs:
+    description: Optional script output key `target_image_refs`.
+    value: ${{ steps.exec.outputs.target_image_refs }}
+  image_map:
+    description: Optional script output key `image_map`.
+    value: ${{ steps.exec.outputs.image_map }}
+  registry_host:
+    description: Optional script output key `registry_host`.
+    value: ${{ steps.exec.outputs.registry_host }}
+  registry_repository:
+    description: Optional script output key `registry_repository`.
+    value: ${{ steps.exec.outputs.registry_repository }}
+  path:
+    description: Optional script output key `path`.
+    value: ${{ steps.exec.outputs.path }}
+  rootfs_dir:
+    description: Optional script output key `rootfs_dir`.
+    value: ${{ steps.exec.outputs.rootfs_dir }}
+  tmp_dir:
+    description: Optional script output key `tmp_dir`.
+    value: ${{ steps.exec.outputs.tmp_dir }}
+  helm_chart_package:
+    description: Optional script output key `helm_chart_package`.
+    value: ${{ steps.exec.outputs.helm_chart_package }}
+  helm_chart_push_mode:
+    description: Optional script output key `helm_chart_push_mode`.
+    value: ${{ steps.exec.outputs.helm_chart_push_mode }}
+  helm_chart_push_location:
+    description: Optional script output key `helm_chart_push_location`.
+    value: ${{ steps.exec.outputs.helm_chart_push_location }}
+
+runs:
+  using: composite
+  steps:
+    - id: exec
+      shell: bash
+      run: |
+        set -euo pipefail
+        canonical_path() {
+          if command -v realpath >/dev/null 2>&1; then
+            realpath "$1"
+          else
+            readlink -f "$1"
+          fi
+        }
+
+        script_input="${{ inputs.script }}"
+        action_root="$(canonical_path "${GITHUB_ACTION_PATH}")"
+        script_candidate=""
+
+        if [[ -f "${script_input}" ]]; then
+          script_candidate="${script_input}"
+        elif [[ -f "${GITHUB_ACTION_PATH}/${script_input}" ]]; then
+          script_candidate="${GITHUB_ACTION_PATH}/${script_input}"
+        elif [[ -f "${GITHUB_ACTION_PATH}/$(basename "${script_input}")" ]]; then
+          script_candidate="${GITHUB_ACTION_PATH}/$(basename "${script_input}")"
+        else
+          echo "Script not found: ${script_input}"
+          exit 1
+        fi
+
+        script_path="$(canonical_path "${script_candidate}")"
+        if [[ "${script_path}" != "${action_root}/"* ]]; then
+          echo "Refusing to execute script outside action directory: ${script_path}"
+          exit 1
+        fi
+        if [[ "${script_path}" != *.sh ]]; then
+          echo "Refusing to execute non-shell helper script: ${script_path}"
+          exit 1
+        fi
+
+        bash "${script_path}"

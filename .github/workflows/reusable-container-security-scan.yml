@@ -1,0 +1,145 @@
+name: Reusable Container Security Scan
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+    inputs:
+      prebuilt_image_ref:
+        description: Optional prebuilt image reference to scan instead of building.
+        required: false
+        type: string
+      container_image_name:
+        description: Image name used in build mode.
+        required: false
+        type: string
+
+jobs:
+  container_security_scan:
+    name: Container Security Scan
+    runs-on: self-hosted
+    timeout-minutes: 45
+    env:
+      CI_PREBUILT_IMAGE_REF: ${{ inputs.prebuilt_image_ref || vars.CI_PREBUILT_IMAGE_REF }}
+      CI_CONTAINER_IMAGE_NAME: ${{ inputs.container_image_name || vars.CI_CONTAINER_IMAGE_NAME }}
+      CI_HADOLINT_IMAGE: ${{ vars.CI_HADOLINT_IMAGE || 'hadolint/hadolint:v2.12.0' }}
+      CI_CLAMAV_IMAGE: ${{ vars.CI_CLAMAV_IMAGE || 'clamav/clamav:stable' }}
+      CI_YARA_IMAGE: ${{ vars.CI_YARA_IMAGE || 'alpine:3.20' }}
+      CI_TRIVY_IMAGE: ${{ vars.CI_TRIVY_IMAGE || 'aquasec/trivy:0.57.1' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve image source mode
+        id: image_source
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        env:
+          PREBUILT_IMAGE_REF: ${{ env.CI_PREBUILT_IMAGE_REF }}
+          CONTAINER_IMAGE_NAME: ${{ env.CI_CONTAINER_IMAGE_NAME }}
+        with:
+          script: resolve_image_source.sh
+
+      - name: Resolve container build file
+        id: build_file
+        if: ${{ steps.image_source.outputs.mode == 'build' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: resolve_build_file.sh
+
+      - name: Malware scan source (ClamAV)
+        if: ${{ steps.image_source.outputs.mode == 'build' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: scan_dir_clamav.sh
+        env:
+          SCAN_PATH: ${{ github.workspace }}
+          SCAN_LABEL: repository source
+          CLAMAV_IMAGE: ${{ env.CI_CLAMAV_IMAGE }}
+
+      - name: Malware scan source (YARA)
+        if: ${{ steps.image_source.outputs.mode == 'build' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: scan_dir_yara.sh
+        env:
+          SCAN_PATH: ${{ github.workspace }}
+          SCAN_LABEL: repository source
+          EXCLUDE_GIT: "true"
+          EXCLUDE_RULES_DIR: "true"
+          YARA_IMAGE: ${{ env.CI_YARA_IMAGE }}
+
+      - name: Lint container build file (Hadolint)
+        if: ${{ steps.image_source.outputs.mode == 'build' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: hadolint_scan.sh
+        env:
+          BUILD_FILE: ${{ steps.build_file.outputs.path }}
+          HADOLINT_IMAGE: ${{ env.CI_HADOLINT_IMAGE }}
+
+      - name: Pull prebuilt image (pull mode)
+        if: ${{ steps.image_source.outputs.mode == 'pull' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: docker_pull_image.sh
+        env:
+          IMAGE_REF: ${{ steps.image_source.outputs.image_ref }}
+
+      - name: Build image for scan (build mode)
+        if: ${{ steps.image_source.outputs.mode == 'build' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: docker_build_image.sh
+        env:
+          BUILD_FILE: ${{ steps.build_file.outputs.path }}
+          IMAGE_REF: ${{ steps.image_source.outputs.image_ref }}
+
+      - name: Prepare image filesystem
+        id: image_rootfs
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: prepare_image_rootfs.sh
+        env:
+          IMAGE_REF: ${{ steps.image_source.outputs.image_ref }}
+
+      - name: Malware scan image filesystem (ClamAV)
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: scan_dir_clamav.sh
+        env:
+          SCAN_PATH: ${{ steps.image_rootfs.outputs.rootfs_dir }}
+          SCAN_LABEL: image filesystem
+          CLAMAV_IMAGE: ${{ env.CI_CLAMAV_IMAGE }}
+
+      - name: Malware scan image filesystem (YARA)
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: scan_dir_yara.sh
+        env:
+          SCAN_PATH: ${{ steps.image_rootfs.outputs.rootfs_dir }}
+          SCAN_LABEL: image filesystem
+          YARA_IMAGE: ${{ env.CI_YARA_IMAGE }}
+
+      - name: Cleanup image filesystem temp files
+        if: ${{ always() && steps.image_rootfs.outputs.tmp_dir != '' }}
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: cleanup_rootfs.sh
+        env:
+          TMP_DIR: ${{ steps.image_rootfs.outputs.tmp_dir }}
+
+      - name: Scan image vulnerabilities (Trivy)
+        uses: adrian91ro/cicd-templates/.github/actions@latest
+        with:
+          script: scan_image_trivy.sh
+        env:
+          IMAGE_REF: ${{ steps.image_source.outputs.image_ref }}
+          TRIVY_IMAGE: ${{ env.CI_TRIVY_IMAGE }}
