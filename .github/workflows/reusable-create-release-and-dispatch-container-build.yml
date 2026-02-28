@@ -83,7 +83,7 @@ jobs:
           BUILD_WORKFLOW_FILE: ${{ inputs.build_workflow_file }}
           BUILD_WORKFLOW_INPUT_NAME: ${{ inputs.build_workflow_input_name }}
         with:
-          github-token: ${{ secrets.release_api_token || secrets.RELEASE_API_TOKEN || github.token }}
+          github-token: ${{ github.token }}
           script: |
             const releaseTag = String(process.env.RELEASE_TAG || "").trim();
             const buildWorkflowFile = String(process.env.BUILD_WORKFLOW_FILE || "").trim();
