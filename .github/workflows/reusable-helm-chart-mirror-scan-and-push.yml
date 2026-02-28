@@ -95,10 +95,10 @@ jobs:
       source_image_refs: ${{ steps.mirror_refs.outputs.source_image_refs }}
       mirrored_image_refs: ${{ steps.tag_mirror_images.outputs.target_image_refs }}
     env:
-      RAW_CI_REGISTRY_HOST: ${{ secrets.artifactory_registry_host || secrets.ARTIFACTORY_CONTAINER_REGISTRY_HOST || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
-      RAW_CI_REGISTRY_REPOSITORY: ${{ inputs.registry_repository || secrets.artifactory_registry_repository || secrets.ARTIFACTORY_CONTAINER_REPO || vars.ARTIFACTORY_CONTAINER_REPO || vars.CI_REGISTRY_REPOSITORY }}
-      RAW_HELM_REGISTRY_HOST: ${{ secrets.artifactory_helm_registry_host || secrets.ARTIFACTORY_HELM_REGISTRY_HOST || vars.ARTIFACTORY_HELM_REGISTRY_HOST || secrets.artifactory_registry_host || secrets.ARTIFACTORY_CONTAINER_REGISTRY_HOST || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
-      RAW_HELM_REPOSITORY: ${{ secrets.ARTIFACTORY_HELM_REPO || vars.ARTIFACTORY_HELM_REPO || secrets.artifactory_registry_repository || secrets.ARTIFACTORY_CONTAINER_REPO || vars.CI_HELM_REPOSITORY }}
+      RAW_CI_REGISTRY_HOST: ${{ secrets.artifactory_registry_host || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
+      RAW_CI_REGISTRY_REPOSITORY: ${{ inputs.registry_repository || secrets.artifactory_registry_repository || vars.ARTIFACTORY_CONTAINER_REPO || vars.CI_REGISTRY_REPOSITORY }}
+      RAW_HELM_REGISTRY_HOST: ${{ secrets.artifactory_helm_registry_host || vars.ARTIFACTORY_HELM_REGISTRY_HOST || secrets.artifactory_registry_host || vars.ARTIFACTORY_CONTAINER_REGISTRY_HOST }}
+      RAW_HELM_REPOSITORY: ${{ vars.ARTIFACTORY_HELM_REPO || secrets.artifactory_registry_repository || vars.CI_HELM_REPOSITORY }}
       CI_HELM_IMAGE: ${{ vars.CI_HELM_IMAGE || 'alpine/helm:3.17.1' }}
       CI_CLAMAV_IMAGE: ${{ vars.CI_CLAMAV_IMAGE || 'clamav/clamav:stable' }}
       CI_YARA_IMAGE: ${{ vars.CI_YARA_IMAGE || 'alpine:3.20' }}

@@ -3,8 +3,10 @@ run-name: Template Quality Gate (${{ github.ref_name }})
 
 on:
   push:
-    branches:
-      - templates
+    branches-ignore:
+      - main
+    tags-ignore:
+      - "*"
 
 permissions:
   contents: read
