@@ -1,0 +1,272 @@
+name: Reusable Helm Chart Mirror from Configs
+
+on:
+  workflow_call:
+    inputs:
+      chart_configs_dir:
+        description: Directory containing Helm chart config files.
+        required: false
+        type: string
+        default: helm_chart_mirrors
+      deployment_environment:
+        description: GitHub environment name (for example development or production).
+        required: false
+        type: string
+      registry_repository:
+        description: Optional registry repository path override (for example docker-local/my-team).
+        required: false
+        type: string
+    secrets:
+      artifactory_registry_repository:
+        description: Optional registry repository path when not using vars/uppercase secrets.
+        required: false
+      artifactory_registry_host:
+        description: Registry hostname, for example artifactory.example.com.
+        required: false
+      artifactory_helm_registry_host:
+        description: Helm repository hostname, for example artifactory.example.com.
+        required: false
+      artifactory_username:
+        description: Artifactory username with push permission.
+        required: false
+      artifactory_token:
+        description: Artifactory access token or password.
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect_chart_configs:
+    name: Detect Helm chart configs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build matrix from Helm chart config files
+        id: collect
+        shell: bash
+        env:
+          CHART_CONFIGS_DIR: ${{ inputs.chart_configs_dir }}
+        run: |
+          set -euo pipefail
+
+          trim() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "${value}"
+          }
+
+          read_cfg_value() {
+            local key="$1"
+            local file="$2"
+            local raw
+            raw="$(sed -n -E "s/^${key}:[[:space:]]*//p" "${file}" | head -n 1 || true)"
+            raw="$(trim "${raw}")"
+            raw="${raw#\"}"
+            raw="${raw%\"}"
+            raw="${raw#\'}"
+            raw="${raw%\'}"
+            printf '%s' "${raw}"
+          }
+
+          read_cfg_block_value() {
+            local key="$1"
+            local file="$2"
+            awk -v key="${key}" '
+              function indent_count(line,  idx) {
+                idx = match(line, /[^ ]/)
+                if (idx == 0) {
+                  return length(line)
+                }
+                return idx - 1
+              }
+
+              BEGIN {
+                capture = 0
+                key_indent = -1
+                content_indent = -1
+              }
+
+              {
+                if (capture == 0) {
+                  pattern = "^[[:space:]]*" key ":[[:space:]]*\\|[[:space:]]*$"
+                  if ($0 ~ pattern) {
+                    capture = 1
+                    key_indent = indent_count($0)
+                  }
+                  next
+                }
+
+                if ($0 ~ /^[[:space:]]*$/) {
+                  print ""
+                  next
+                }
+
+                current_indent = indent_count($0)
+                if (current_indent <= key_indent) {
+                  exit
+                }
+
+                if (content_indent < 0 || current_indent < content_indent) {
+                  content_indent = current_indent
+                }
+
+                print substr($0, content_indent + 1)
+              }
+            ' "${file}"
+          }
+
+          if [[ -z "${CHART_CONFIGS_DIR}" ]]; then
+            echo "chart_configs_dir input cannot be empty."
+            exit 1
+          fi
+
+          if [[ ! -d "${CHART_CONFIGS_DIR}" ]]; then
+            echo "Chart config directory does not exist: ${CHART_CONFIGS_DIR}"
+            exit 1
+          fi
+
+          chart_files="$(
+            find "${CHART_CONFIGS_DIR}" -type f \( -name '*.yml' -o -name '*.yaml' \) \
+              ! -name '*.values.yml' ! -name '*.values.yaml' \
+              | sed 's|^\./||' | sort -u || true
+          )"
+          if [[ -z "${chart_files}" ]]; then
+            echo "No Helm chart config files found under ${CHART_CONFIGS_DIR}/."
+            exit 1
+          fi
+
+          echo "Discovered Helm chart config files:"
+          while IFS= read -r cfg_file; do
+            if [[ -z "${cfg_file}" ]]; then
+              continue
+            fi
+            echo " - ${cfg_file}"
+          done <<< "${chart_files}"
+
+          matrix='[]'
+          while IFS= read -r cfg_file; do
+            if [[ -z "${cfg_file}" || ! -f "${cfg_file}" ]]; then
+              continue
+            fi
+
+            repo_name="$(read_cfg_value "helm_repo_name" "${cfg_file}")"
+            repo_url="$(read_cfg_value "helm_repo_url" "${cfg_file}")"
+            chart_name="$(read_cfg_value "helm_chart_name" "${cfg_file}")"
+            chart_version="$(read_cfg_value "helm_chart_version" "${cfg_file}")"
+            helm_values_file="$(read_cfg_value "helm_values_file" "${cfg_file}")"
+            helm_values_yaml="$(read_cfg_block_value "extra_helm_keys_values" "${cfg_file}")"
+            mirror_path_prefix="$(read_cfg_value "mirror_path_prefix" "${cfg_file}")"
+
+            if [[ -z "${repo_name}" || -z "${repo_url}" || -z "${chart_name}" || -z "${chart_version}" ]]; then
+              echo "Config ${cfg_file} is missing required fields: helm_repo_name, helm_repo_url, helm_chart_name, helm_chart_version."
+              exit 1
+            fi
+
+            if [[ -n "${helm_values_file}" && -n "${helm_values_yaml}" ]]; then
+              echo "Config ${cfg_file} sets both helm_values_file and extra_helm_keys_values. Use only one."
+              exit 1
+            fi
+
+            cfg_name="$(basename "${cfg_file}")"
+            cfg_name="${cfg_name%.yml}"
+            cfg_name="${cfg_name%.yaml}"
+
+            if [[ -z "${helm_values_file}" && -z "${helm_values_yaml}" ]]; then
+              if [[ -f "${CHART_CONFIGS_DIR}/${cfg_name}.values.yaml" ]]; then
+                helm_values_file="${CHART_CONFIGS_DIR}/${cfg_name}.values.yaml"
+              elif [[ -f "${CHART_CONFIGS_DIR}/${cfg_name}.values.yml" ]]; then
+                helm_values_file="${CHART_CONFIGS_DIR}/${cfg_name}.values.yml"
+              fi
+            fi
+
+            if [[ -n "${helm_values_file}" && ! -f "${helm_values_file}" ]]; then
+              alternate_values_file=""
+              if [[ "${helm_values_file}" == *.yaml ]]; then
+                alternate_values_file="${helm_values_file%.yaml}.yml"
+              elif [[ "${helm_values_file}" == *.yml ]]; then
+                alternate_values_file="${helm_values_file%.yml}.yaml"
+              fi
+
+              if [[ -n "${alternate_values_file}" && -f "${alternate_values_file}" ]]; then
+                echo "Values file '${helm_values_file}' not found, using '${alternate_values_file}' instead."
+                helm_values_file="${alternate_values_file}"
+              else
+                echo "Config ${cfg_file} references helm_values_file='${helm_values_file}' but file does not exist."
+                exit 1
+              fi
+            fi
+
+            if [[ -z "${mirror_path_prefix}" ]]; then
+              mirror_path_prefix="${cfg_name}"
+            fi
+
+            matrix="$(jq -c \
+              --arg config_file "${cfg_file}" \
+              --arg helm_repo_name "${repo_name}" \
+              --arg helm_repo_url "${repo_url}" \
+              --arg helm_chart_name "${chart_name}" \
+              --arg helm_chart_version "${chart_version}" \
+              --arg helm_values_file "${helm_values_file}" \
+              --arg helm_values_yaml "${helm_values_yaml}" \
+              --arg helm_release_name "${cfg_name}" \
+              --arg helm_namespace "default" \
+              --arg mirror_path_prefix "${mirror_path_prefix}" \
+              '. + [{
+                config_file: $config_file,
+                helm_repo_name: $helm_repo_name,
+                helm_repo_url: $helm_repo_url,
+                helm_chart_name: $helm_chart_name,
+                helm_chart_version: $helm_chart_version,
+                helm_values_file: $helm_values_file,
+                helm_values_yaml: $helm_values_yaml,
+                helm_release_name: $helm_release_name,
+                helm_namespace: $helm_namespace,
+                mirror_path_prefix: $mirror_path_prefix
+              }]' <<< "${matrix}")"
+          done <<< "${chart_files}"
+
+          matrix="$(jq -c . <<< "${matrix}")"
+          echo "Resolved chart matrix: ${matrix}"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  mirror_charts:
+    name: Mirror Helm charts
+    needs:
+      - detect_chart_configs
+    if: ${{ needs.detect_chart_configs.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: ${{ fromJson(needs.detect_chart_configs.outputs.matrix) }}
+    uses: adrian91ro/cicd-templates/.github/workflows/reusable-helm-chart-mirror-scan-and-push.yml@latest
+    with:
+      helm_repo_name: ${{ matrix.chart.helm_repo_name }}
+      helm_repo_url: ${{ matrix.chart.helm_repo_url }}
+      helm_chart_name: ${{ matrix.chart.helm_chart_name }}
+      helm_chart_version: ${{ matrix.chart.helm_chart_version }}
+      helm_values_file: ${{ matrix.chart.helm_values_file }}
+      helm_values_yaml: ${{ matrix.chart.helm_values_yaml }}
+      helm_release_name: ${{ matrix.chart.helm_release_name }}
+      helm_namespace: ${{ matrix.chart.helm_namespace }}
+      mirror_path_prefix: ${{ matrix.chart.mirror_path_prefix }}
+      deployment_environment: ${{ inputs.deployment_environment }}
+      registry_repository: ${{ inputs.registry_repository }}
+    secrets:
+      artifactory_registry_repository: ${{ secrets.artifactory_registry_repository }}
+      artifactory_registry_host: ${{ secrets.artifactory_registry_host }}
+      artifactory_helm_registry_host: ${{ secrets.artifactory_helm_registry_host }}
+      artifactory_username: ${{ secrets.artifactory_username }}
+      artifactory_token: ${{ secrets.artifactory_token }}

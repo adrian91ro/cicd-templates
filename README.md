@@ -173,7 +173,7 @@ name: Helm Chart Mirror
 
 on:
   push:
-    branches: [master]
+    branches: [main]
 
 permissions:
   contents: read
