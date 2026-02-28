@@ -81,10 +81,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   helm_chart_mirror_scan_and_push:
     name: Helm Chart Mirror, Scan, and Push
