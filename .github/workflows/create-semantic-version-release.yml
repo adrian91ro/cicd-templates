@@ -20,8 +20,6 @@ jobs:
     with:
       release_branch: main
       source_branch: main
-    secrets:
-      release_api_token: ${{ secrets.RELEASE_API_TOKEN }}
 
   move_latest_tag_to_new_release:
     name: Move latest tag to newest semantic release
@@ -35,7 +33,7 @@ jobs:
         env:
           NEXT_TAG: ${{ needs.create_semantic_version_release.outputs.next_tag }}
         with:
-          github-token: ${{ secrets.RELEASE_API_TOKEN || github.token }}
+          github-token: ${{ github.token }}
           script: |
             const nextTag = String(process.env.NEXT_TAG || "").trim();
             if (!nextTag) {
